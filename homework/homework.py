@@ -95,3 +95,172 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    precision_score, balanced_accuracy_score, recall_score,
+    f1_score, confusion_matrix
+)
+import pandas as pd
+import numpy as np
+import os
+import json
+import gzip
+import pickle
+
+datos_entrenamiento = pd.read_csv(
+    "files/input/train_data.csv.zip", compression="zip"
+)
+datos_prueba = pd.read_csv(
+    "files/input/test_data.csv.zip", compression="zip"
+)
+
+# Limpieza y preprocesamiento básico
+for df_actual in [datos_entrenamiento, datos_prueba]:
+    df_actual.rename(
+        columns={"default payment next month": "default"}, inplace=True
+    )
+    df_actual.drop(columns=["ID"], inplace=True)
+
+    df_actual["EDU"] = df_actual["EDUCATION"].replace(0, np.nan)
+    df_actual["MAR"] = df_actual["MARRIAGE"].replace(0, np.nan)
+
+    df_actual.drop(columns=["EDUCATION", "MARRIAGE"], inplace=True)
+    df_actual.rename(
+        columns={"EDU": "EDUCATION", "MAR": "MARRIAGE"}, inplace=True
+    )
+
+    df_actual.dropna(inplace=True)
+    df_actual.loc[df_actual["EDUCATION"] > 4, "EDUCATION"] = 4
+
+# División en variables explicativas y objetivo
+X_train = datos_entrenamiento.drop(columns="default")
+y_train = datos_entrenamiento["default"]
+X_test = datos_prueba.drop(columns="default")
+y_test = datos_prueba["default"]
+
+# Definición de columnas categóricas y numéricas
+columnas_categoricas = ["SEX", "EDUCATION", "MARRIAGE"]
+columnas_numericas = [c for c in X_train.columns if c not in columnas_categoricas]
+
+# Transformador de columnas
+transformador_columnas = ColumnTransformer(
+    transformers=[
+        ("num_scaling", MinMaxScaler(), columnas_numericas),
+        ("cat_encoding", OneHotEncoder(handle_unknown="ignore"), columnas_categoricas),
+    ]
+)
+
+# Pipeline del modelo
+flujo_modelo = Pipeline(
+    steps=[
+        ("prep_layer", transformador_columnas),
+        ("feature_selector", SelectKBest(score_func=f_classif)),
+        ("clf", LogisticRegression()),
+    ]
+)
+
+# Rejilla de hiperparámetros
+rejilla_hiperparametros = {
+    "clf__C": [0.7, 0.8, 0.9],
+    "clf__solver": ["liblinear", "saga"],
+    "clf__max_iter": [1500],
+    "feature_selector__k": [1, 2, 5, 10],
+}
+
+validador_estratificado = StratifiedKFold(
+    n_splits=10, shuffle=True, random_state=42
+)
+
+busqueda_cv = GridSearchCV(
+    estimator=flujo_modelo,
+    param_grid=rejilla_hiperparametros,
+    scoring="balanced_accuracy",
+    cv=validador_estratificado,
+    n_jobs=-1,
+    verbose=1,
+)
+
+# Entrenamiento con búsqueda de hiperparámetros
+busqueda_cv.fit(X_train, y_train)
+print("Parámetros óptimos:", busqueda_cv.best_params_)
+
+# Guardado del modelo
+os.makedirs("files/models", exist_ok=True)
+with gzip.open("files/models/model.pkl.gz", "wb") as archivo_modelo:
+    pickle.dump(busqueda_cv, archivo_modelo)
+
+# Predicciones
+y_train_pred = busqueda_cv.predict(X_train)
+y_test_pred = busqueda_cv.predict(X_test)
+
+# Cálculo de métricas
+lista_metricas = [
+    {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": float(round(precision_score(y_train, y_train_pred), 4)),
+        "balanced_accuracy": float(
+            round(balanced_accuracy_score(y_train, y_train_pred), 4)
+        ),
+        "recall": float(round(recall_score(y_train, y_train_pred), 4)),
+        "f1_score": float(round(f1_score(y_train, y_train_pred), 4)),
+    },
+    {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": float(round(precision_score(y_test, y_test_pred), 4)),
+        "balanced_accuracy": float(
+            round(balanced_accuracy_score(y_test, y_test_pred), 4)
+        ),
+        "recall": float(round(recall_score(y_test, y_test_pred), 4)),
+        "f1_score": float(round(f1_score(y_test, y_test_pred), 4)),
+    },
+]
+
+# Matrices de confusión
+matriz_train = confusion_matrix(y_train, y_train_pred)
+matriz_test = confusion_matrix(y_test, y_test_pred)
+
+lista_metricas.append(
+    {
+        "type": "cm_matrix",
+        "dataset": "train",
+        "true_0": {
+            "predicted_0": int(matriz_train[0, 0]),
+            "predicted_1": int(matriz_train[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(matriz_train[1, 0]),
+            "predicted_1": int(matriz_train[1, 1]),
+        },
+    }
+)
+
+lista_metricas.append(
+    {
+        "type": "cm_matrix",
+            "dataset": "test",
+        "true_0": {
+            "predicted_0": int(matriz_test[0, 0]),
+            "predicted_1": int(matriz_test[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(matriz_test[1, 0]),
+            "predicted_1": int(matriz_test[1, 1]),
+        },
+    }
+)
+
+# Escritura del archivo de salida
+os.makedirs("files/output", exist_ok=True)
+with open("files/output/metrics.json", "w", encoding="utf-8") as archivo_salida:
+    for registro in lista_metricas:
+        archivo_salida.write(json.dumps(registro) + "\n")
+
